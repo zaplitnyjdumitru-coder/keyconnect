@@ -24,6 +24,9 @@ EXE = "xray.exe" if IS_WIN else "xray"
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 SUPPORTED_NETS = {"tcp", "raw", "ws", "grpc", "httpupgrade", "xhttp", "splithttp"}
 TEST_URL = "http://www.gstatic.com/generate_204"
+# «+local» — запросы к DoH идут напрямую, а не через сам VPN; последний — системный DNS как запасной
+DOH_SERVERS = ["https+local://1.1.1.1/dns-query", "https+local://8.8.8.8/dns-query",
+               "https+local://9.9.9.9/dns-query", "localhost"]
 
 
 # ---------- конфиг ----------
@@ -38,6 +41,8 @@ def _stream_settings(s: dict) -> dict:
     st: dict = {"network": net, "security": sec}
     alpn = [a.strip() for a in (s.get("alpn") or "").split(",") if a.strip()]
 
+    if net in ("ws", "httpupgrade"):
+        alpn = ["http/1.1"]  # WebSocket работает только поверх HTTP/1.1, иначе CDN может выбрать h2
     if sec == "tls":
         tls = {"serverName": s.get("sni") or s.get("host") or s["address"],
                "fingerprint": s.get("fp") or "chrome"}
@@ -110,8 +115,27 @@ def build_outbound(s: dict) -> dict:
                                  "method": s["method"], "password": s["password"]}]}
     else:
         raise ValueError(f"неизвестный протокол {proto}")
-    return {"tag": "proxy", "protocol": proto, "settings": settings,
-            "streamSettings": _stream_settings(s)}
+    ob = {"tag": "proxy", "protocol": proto, "settings": settings,
+          "streamSettings": _stream_settings(s)}
+    if s.get("mux") and not s.get("flow"):  # mux несовместим с XTLS Vision
+        try:
+            conc = int(str(s.get("mux_concurrency") or 8).split("-")[0])
+        except ValueError:
+            conc = 8
+        ob["mux"] = {"enabled": True, "concurrency": conc, "xudpConcurrency": conc,
+                     "xudpProxyUDP443": "reject"}
+    if s.get("fragment"):
+        ob["streamSettings"].setdefault("sockopt", {})["dialerProxy"] = "fragment"
+    return ob
+
+
+def parse_fragment(value: str) -> dict:
+    """«100-200,10-20,tlshello» → {"packets": "tlshello", "length": "100-200", "interval": "10-20"}."""
+    parts = [x.strip() for x in value.split(",") if x.strip()]
+    packets = next((x for x in parts if not x[0].isdigit()), "tlshello")
+    nums = [x for x in parts if x[0].isdigit()]
+    return {"packets": packets, "length": nums[0] if nums else "100-200",
+            "interval": nums[1] if len(nums) > 1 else "10-20"}
 
 
 def build_config(server: dict, socks_port: int | None = 10808, http_port: int | None = 10809,
@@ -143,6 +167,17 @@ def build_config(server: dict, socks_port: int | None = 10808, http_port: int | 
         outbounds = [build_outbound(server),
                      {"tag": "direct", "protocol": "freedom"},
                      {"tag": "block", "protocol": "blackhole"}]
+        if server.get("fragment"):  # дробление TLS ClientHello против DPI
+            outbounds.append({"tag": "fragment", "protocol": "freedom",
+                              "settings": {"fragment": parse_fragment(server["fragment"])},
+                              "streamSettings": {"sockopt": {"tcpNoDelay": True}}})
+    # Адрес VPN-сервера узнаём через защищённый DNS (DoH) в обход DNS провайдера:
+    # провайдеры подменяют ответы для доменов VPN-сервисов, и соединение сразу рвётся.
+    for o in outbounds:
+        if o.get("tag") == "proxy":
+            o.setdefault("streamSettings", {}).setdefault("sockopt", {}).setdefault("domainStrategy", "UseIPv4")
+        if o.get("tag") == "fragment":
+            o.setdefault("settings", {}).setdefault("domainStrategy", "UseIPv4")
     rules = [{"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}]
     if bypass_ru:
         rules += [
@@ -152,6 +187,7 @@ def build_config(server: dict, socks_port: int | None = 10808, http_port: int | 
         ]
     return {
         "log": {"loglevel": loglevel},
+        "dns": {"servers": DOH_SERVERS, "queryStrategy": "UseIPv4"},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {"domainStrategy": "IPIfNonMatch" if bypass_ru else "AsIs", "rules": rules},

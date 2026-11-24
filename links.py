@@ -12,7 +12,7 @@ import uuid as _uuid
 
 SCHEMES = ("vless", "vmess", "trojan", "ss")
 # Панели (Remnawave, Marzban и др.) выбирают формат подписки по User-Agent — пробуем по очереди
-USER_AGENTS = ("v2rayN/7.13.8", "Happ/3.3.0", "Hiddify/2.5.7")
+USER_AGENTS = ("Happ/3.3.0", "v2rayN/7.13.8", "Hiddify/2.5.7")
 PROXY_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks", "hysteria", "hysteria2", "wireguard", "socks", "http")
 
 
@@ -66,6 +66,9 @@ def _transport(p: dict, default_security: str = "none") -> dict:
         "vcn": _q(p, "vcn"),
         "pqv": _q(p, "pqv"),
         "extra": _q(p, "extra"),
+        "fragment": _q(p, "fragment"),
+        "mux": _q(p, "mux") in ("1", "true"),
+        "mux_concurrency": _q(p, "muxConcurrency", "8"),
     }
 
 
