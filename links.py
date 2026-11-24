@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import platform
 import re
 import urllib.parse as up
 import urllib.request
+import uuid as _uuid
 
 SCHEMES = ("vless", "vmess", "trojan", "ss")
-USER_AGENT = "v2rayN/7.0"  # многие панели отдают base64-список именно под этот UA
+# Панели (Remnawave, Marzban и др.) выбирают формат подписки по User-Agent — пробуем по очереди
+USER_AGENTS = ("v2rayN/7.13.8", "Happ/3.3.0", "Hiddify/2.5.7")
+PROXY_PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks", "hysteria", "hysteria2", "wireguard", "socks", "http")
 
 
 class LinkError(ValueError):
@@ -57,6 +62,10 @@ def _transport(p: dict, default_security: str = "none") -> dict:
         "mode": _q(p, "mode"),
         "header_type": _q(p, "headerType"),
         "allow_insecure": _q(p, "allowInsecure", _q(p, "insecure")) in ("1", "true"),
+        "pcs": _q(p, "pcs"),
+        "vcn": _q(p, "vcn"),
+        "pqv": _q(p, "pqv"),
+        "extra": _q(p, "extra"),
     }
 
 
@@ -165,13 +174,59 @@ def parse_link(link: str) -> dict:
     return server
 
 
+def _ob_address(ob: dict) -> tuple[str, int]:
+    st = ob.get("settings") or {}
+    for key in ("vnext", "servers", "peers"):
+        lst = st.get(key)
+        if lst:
+            first = lst[0]
+            if key == "peers":
+                host, _, port = (first.get("endpoint") or ":0").rpartition(":")
+                return host.strip("[]"), int(port or 0)
+            return str(first.get("address", "")), int(first.get("port") or 0)
+    return str(st.get("address", "")), int(st.get("port") or 0)
+
+
+def parse_xray_json(text: str) -> list[dict]:
+    """Подписка в формате готовых конфигов Xray (один объект или массив)."""
+    data = json.loads(text)
+    configs = data if isinstance(data, list) else [data]
+    servers = []
+    for cfg in configs:
+        if not isinstance(cfg, dict):
+            continue
+        obs = [o for o in cfg.get("outbounds") or [] if isinstance(o, dict)]
+        main = next((o for o in obs if o.get("tag") == "proxy"), None) or \
+            next((o for o in obs if o.get("protocol") in PROXY_PROTOCOLS), None)
+        if not main:
+            continue
+        addr, port = _ob_address(main)
+        st = main.get("streamSettings") or {}
+        servers.append({
+            "protocol": main.get("protocol", "?"),
+            "name": cfg.get("remarks") or f"{addr}:{port}",
+            "address": addr, "port": port,
+            "network": st.get("network") or "tcp",
+            "security": st.get("security") or "none",
+            "outbounds": obs, "main_tag": main.get("tag") or "proxy",
+            "link": "xray-json:" + hashlib.sha1(
+                json.dumps(main, sort_keys=True).encode()).hexdigest(),
+        })
+    return servers
+
+
 def parse_many(text: str) -> tuple[list[dict], list[str]]:
-    """Список ключей построчно или base64-блоком (как в подписках)."""
-    text = text.strip()
-    if "://" not in text:
+    """Ключи построчно, base64-блоком или JSON-конфиги Xray (как в подписках)."""
+    text = text.strip().lstrip("\ufeff")
+    if "://" not in text and not text.startswith(("{", "[")):
         try:
-            text = b64decode(text)
+            text = b64decode(text).strip()
         except Exception:
+            pass
+    if text.startswith(("{", "[")):
+        try:
+            return parse_xray_json(text), []
+        except ValueError:
             pass
     servers, errors = [], []
     for line in text.splitlines():
@@ -187,26 +242,63 @@ def parse_many(text: str) -> tuple[list[dict], list[str]]:
     return servers, errors
 
 
-def fetch_text(url: str, proxy_port: int | None = None, timeout: int = 15) -> str:
+def hwid() -> str:
+    """Постоянный идентификатор устройства — некоторые сервисы без него не отдают подписку."""
+    raw = f"{_uuid.getnode()}-{platform.node()}-{platform.system()}-keyconnect"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _headers(ua: str) -> dict:
+    return {
+        "User-Agent": ua, "Accept": "*/*",
+        "x-hwid": hwid(),
+        "x-device-os": {"Darwin": "macOS"}.get(platform.system(), platform.system()),
+        "x-ver-os": platform.release(),
+        "x-device-model": platform.node() or "PC",
+    }
+
+
+def fetch_text(url: str, proxy_port: int | None = None, timeout: int = 15,
+               ua: str = USER_AGENTS[0]) -> str:
     handler = urllib.request.ProxyHandler(
         {"http": f"http://127.0.0.1:{proxy_port}", "https": f"http://127.0.0.1:{proxy_port}"}
         if proxy_port else {}
     )
     opener = urllib.request.build_opener(handler)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, headers=_headers(ua))
     with opener.open(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
 
 
+def _describe(text: str) -> str:
+    t = text.strip()[:400].lower()
+    if t.startswith("<") or "<html" in t:
+        return "сервер вернул веб-страницу вместо подписки"
+    if t.startswith(("proxies:", "port:", "mixed-port:")) or "\nproxies:" in t:
+        return "подписка в формате Clash — он пока не поддерживается"
+    if '"outbounds"' in t and '"type"' in t:
+        return "подписка в формате sing-box — он пока не поддерживается"
+    if not t:
+        return "сервер вернул пустой ответ (возможно, превышен лимит устройств)"
+    return f"неизвестный формат ответа: {text.strip()[:60]!r}"
+
+
 def fetch_subscription(url: str, proxy_port: int | None = None) -> tuple[list[dict], list[str]]:
-    """Сначала напрямую; если не вышло и есть активный прокси — через него."""
-    try:
-        text = fetch_text(url)
-    except Exception:
-        if not proxy_port:
-            raise
-        text = fetch_text(url, proxy_port)
-    servers, errors = parse_many(text)
-    if not servers and not errors:
-        raise LinkError("в подписке нет ключей (возможно, формат Clash/sing-box)")
-    return servers, errors
+    """Пробуем несколько User-Agent; напрямую, а при неудаче — через активный прокси."""
+    reasons = []
+    for ua in USER_AGENTS:
+        try:
+            try:
+                text = fetch_text(url, ua=ua)
+            except Exception:
+                if not proxy_port:
+                    raise
+                text = fetch_text(url, proxy_port, ua=ua)
+        except Exception as e:  # noqa: BLE001
+            reasons.append(f"{ua}: {e}")
+            continue
+        servers, errors = parse_many(text)
+        if servers:
+            return servers, errors
+        reasons.append(f"{ua}: " + ("; ".join(errors[:3]) if errors else _describe(text)))
+    raise LinkError("ключи не найдены.\n" + "\n".join(reasons))

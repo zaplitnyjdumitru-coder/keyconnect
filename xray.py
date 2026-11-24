@@ -1,6 +1,7 @@
 """Сборка конфига Xray, загрузка ядра, запуск и тест задержки."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import platform
@@ -42,8 +43,11 @@ def _stream_settings(s: dict) -> dict:
                "fingerprint": s.get("fp") or "chrome"}
         if alpn:
             tls["alpn"] = alpn
-        if s.get("allow_insecure"):
-            tls["allowInsecure"] = True
+        # allowInsecure удалён в Xray 26 — с ним ядро не стартует, поэтому не передаём
+        if s.get("pcs"):
+            tls["pinnedPeerCertSha256"] = s["pcs"]
+        if s.get("vcn"):
+            tls["verifyPeerCertByName"] = s["vcn"]
         st["tlsSettings"] = tls
     elif sec == "reality":
         if not s.get("pbk"):
@@ -55,6 +59,8 @@ def _stream_settings(s: dict) -> dict:
             "shortId": s.get("sid") or "",
             "spiderX": s.get("spx") or "",
         }
+        if s.get("pqv"):
+            st["realitySettings"]["mldsa65Verify"] = s["pqv"]
     elif sec != "none":
         st["security"] = "none"
 
@@ -69,6 +75,11 @@ def _stream_settings(s: dict) -> dict:
     elif net == "xhttp":
         st["xhttpSettings"] = {"path": path, "mode": s.get("mode") or "auto",
                                **({"host": host} if host else {})}
+        if s.get("extra"):
+            try:
+                st["xhttpSettings"]["extra"] = json.loads(s["extra"])
+            except ValueError:
+                pass
     elif net in ("tcp", "raw") and s.get("header_type") == "http":
         st["tcpSettings"] = {"header": {"type": "http", "request": {
             "path": [path],
@@ -113,6 +124,25 @@ def build_config(server: dict, socks_port: int | None = 10808, http_port: int | 
     if http_port:
         inbounds.append({"tag": "http", "listen": "127.0.0.1", "port": http_port,
                          "protocol": "http", "sniffing": sniff})
+    if server.get("outbounds"):  # сервер из JSON-подписки: берём его outbounds как есть
+        outbounds = copy.deepcopy(server["outbounds"])
+        main_tag = server.get("main_tag") or "proxy"
+        for o in outbounds:
+            if o.get("tag") == main_tag:
+                o["tag"] = "proxy"
+            sockopt = (o.get("streamSettings") or {}).get("sockopt") or {}
+            if sockopt.get("dialerProxy") == main_tag:
+                sockopt["dialerProxy"] = "proxy"
+        outbounds.sort(key=lambda o: o.get("tag") != "proxy")
+        tags = {o.get("tag") for o in outbounds}
+        if "direct" not in tags:
+            outbounds.append({"tag": "direct", "protocol": "freedom"})
+        if "block" not in tags:
+            outbounds.append({"tag": "block", "protocol": "blackhole"})
+    else:
+        outbounds = [build_outbound(server),
+                     {"tag": "direct", "protocol": "freedom"},
+                     {"tag": "block", "protocol": "blackhole"}]
     rules = [{"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}]
     if bypass_ru:
         rules += [
@@ -123,9 +153,7 @@ def build_config(server: dict, socks_port: int | None = 10808, http_port: int | 
     return {
         "log": {"loglevel": loglevel},
         "inbounds": inbounds,
-        "outbounds": [build_outbound(server),
-                      {"tag": "direct", "protocol": "freedom"},
-                      {"tag": "block", "protocol": "blackhole"}],
+        "outbounds": outbounds,
         "routing": {"domainStrategy": "IPIfNonMatch" if bypass_ru else "AsIs", "rules": rules},
     }
 
